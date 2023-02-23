@@ -27,19 +27,19 @@ impl Leaf {
         }
     }
 
-    fn tenet(&self) -> Node {
-        let get_parent = |child, (direction, sibling_hash)| {
-            let sibling = Node::childless(sibling_hash, false, false);
+    fn extension(&self) -> Node {
+        let get_parent = |delete, (direction, sibling)| {
+            let sibling = Node::sibling(sibling);
 
             match direction {
-                Direction::Left => Node::parent(child, sibling),
-                Direction::Right => Node::parent(sibling, child),
+                Direction::Left => Node::branch(delete, sibling, false),
+                Direction::Right => Node::branch(sibling, delete, false),
             }
         };
 
-        let leaf = Node::childless(self.hash, true, false);
+        let delete = Node::delete(self.hash);
 
-        std::iter::zip(self.path.clone(), self.proof.clone()).fold(leaf, get_parent)
+        std::iter::zip(self.path.clone(), self.proof.clone()).fold(delete, get_parent)
     }
 }
 
@@ -59,37 +59,66 @@ fn parent_hash(left: &Hash, right: &Hash) -> Hash {
 struct Node {
     hash: Hash,
     children: Option<Box<(Node, Node)>>,
+    cache: bool,
     delete: bool,
-    track: bool,
+    proof: bool,
 }
 
 impl Node {
-    fn childless(hash: Hash, delete: bool, track: bool) -> Self {
+    fn branch(left: Node, right: Node, cache: bool) -> Self {
         Self {
-            hash,
-            children: None,
-            delete,
-            track,
+            hash: parent_hash(&left.hash, &right.hash),
+            cache,
+            delete: left.delete || right.delete,
+            proof: left.proof || right.proof,
+            children: if cache || left.delete || right.delete || left.proof || right.proof {
+                Some(Box::new((left, right)))
+            } else {
+                None
+            },
         }
     }
 
-    fn parent(left: Node, right: Node) -> Self {
-        Self {
-            hash: parent_hash(&left.hash, &right.hash),
-            delete: left.delete || right.delete,
-            track: left.track || right.track,
-            children: Some(Box::new((left, right))),
+    fn delete(hash: Hash) -> Node {
+        Node {
+            hash,
+            children: None,
+            cache: false,
+            delete: true,
+            proof: false,
+        }
+    }
+    fn proof(hash: Hash) -> Node {
+        Node {
+            hash,
+            children: None,
+            cache: false,
+            delete: false,
+            proof: true,
+        }
+    }
+    fn sibling(hash: Hash) -> Node {
+        Node {
+            hash,
+            children: None,
+            cache: false,
+            delete: false,
+            proof: false,
         }
     }
 
     fn verify(&self) {
         if let Some((left, right)) = self.children.as_deref() {
             assert!(self.hash == parent_hash(&left.hash, &right.hash));
+            assert!(self.cache || self.proof || self.delete);
+            assert!(left.cache == right.cache);
             assert!(self.delete == left.delete || right.delete);
-            assert!(self.track == left.track || right.track);
+            assert!(self.proof == left.proof || right.proof);
 
             left.verify();
             right.verify();
+        } else {
+            assert!(!self.cache);
         }
     }
 
@@ -97,7 +126,11 @@ impl Node {
         let (left, right) = self.children.as_deref().expect("called update on a leaf");
         self.hash = parent_hash(&left.hash, &right.hash);
         self.delete = left.delete || right.delete;
-        self.track = left.track || right.track;
+        self.proof = left.proof || right.proof;
+
+        if !self.cache && !self.delete && !self.proof {
+            self.children = None;
+        }
     }
 
     fn extend(&mut self, mut leaf: Leaf) -> Option<Leaf> {
@@ -114,7 +147,7 @@ impl Node {
         }
 
         if self.children.is_none() {
-            let extension = leaf.tenet();
+            let extension = leaf.extension();
 
             if self.hash != extension.hash {
                 return None;
@@ -189,7 +222,7 @@ impl Node {
     }
 
     fn proove(&self, hash: Hash) -> Option<Leaf> {
-        if !self.track {
+        if !self.proof {
             return None;
         }
 
@@ -214,29 +247,34 @@ impl Node {
         None
     }
 
-    fn prune_delete(&mut self, keep: isize) {
+    fn prune(&mut self) {
         if !self.delete {
             return;
         }
 
-        if keep <= 0 && !self.track {
-            self.children.take();
-        } else if let Some((left, right)) = self.children.as_deref_mut() {
-            left.prune_delete(keep - 1);
-            right.prune_delete(keep - 1);
+        self.delete = false;
+
+        if !self.cache && !self.proof {
+            self.children = None;
+            return;
         }
 
-        self.delete = false;
+        let (left, right) = self.children.as_deref_mut().unwrap();
+
+        left.prune();
+        right.prune();
     }
 
-    fn prune_cached(&mut self, keep: isize) {
+    fn increase_proof_limit(&mut self) {
         assert!(!self.delete);
 
-        if keep <= 0 && !self.track {
-            self.children.take();
-        } else if let Some((left, right)) = self.children.as_deref_mut() {
-            left.prune_cached(keep - 1);
-            right.prune_cached(keep - 1);
+        let (left, right) = self.children.as_deref_mut().unwrap();
+
+        if left.cache && right.cache {
+            left.increase_proof_limit();
+            right.increase_proof_limit();
+        } else {
+            self.children = None;
         }
     }
 }
@@ -261,27 +299,6 @@ impl Accumulator {
             .for_each(|r| r.verify())
     }
 
-    fn add(&mut self, hash: Hash, track: bool) {
-        let get_parent = |node: Node, (height, root): (usize, Node)| {
-            if node.track || root.track || height >= self.proof_limit {
-                Node::parent(node, root)
-            } else {
-                Node::childless(parent_hash(&node.hash, &root.hash), false, track)
-            }
-        };
-
-        let n_roots = self.roots.iter().position(|r| r.is_none()).unwrap();
-
-        let root = self
-            .roots
-            .iter_mut()
-            .map_while(|r| r.take())
-            .enumerate()
-            .fold(Node::childless(hash, false, track), get_parent);
-
-        self.roots[n_roots] = Some(root);
-    }
-
     fn update(&mut self, deletions: Vec<Leaf>, additions: Vec<(Hash, bool)>) -> Option<Vec<Leaf>> {
         let proofs: Option<Vec<Leaf>> = deletions
             .into_iter()
@@ -291,9 +308,8 @@ impl Accumulator {
         if proofs.is_none() {
             self.roots
                 .iter_mut()
-                .enumerate()
-                .filter_map(|(i, r)| Some((i, r.as_mut()?)))
-                .for_each(|(i, r)| r.prune_delete(i.saturating_sub(self.proof_limit) as isize));
+                .filter_map(|r| r.as_mut())
+                .for_each(|r| r.prune());
 
             return None;
         }
@@ -325,9 +341,22 @@ impl Accumulator {
             assert!(n_roots == height_min);
         }
 
-        additions
-            .into_iter()
-            .for_each(|(hash, track)| self.add(hash, track));
+        for (hash, proof) in additions {
+            let mut root = if proof {
+                Node::proof(hash)
+            } else {
+                Node::sibling(hash)
+            };
+
+            let mut height = 0;
+
+            for sibling in self.roots.iter_mut().map_while(|r| r.take()) {
+                root = Node::branch(root, sibling, height >= self.proof_limit);
+                height += 1;
+            }
+
+            self.roots[height] = Some(root);
+        }
 
         proofs
     }
@@ -340,13 +369,11 @@ impl Accumulator {
     }
 
     fn increase_proof_limit(&mut self) {
-        self.proof_limit += 1;
-
         self.roots
             .iter_mut()
-            .enumerate()
-            .filter_map(|(i, r)| Some((i, r.as_mut()?)))
-            .for_each(|(i, r)| r.prune_cached(i.saturating_sub(self.proof_limit) as isize));
+            .filter_map(|r| r.as_mut())
+            .for_each(|r| r.increase_proof_limit());
+        self.proof_limit += 1;
     }
 }
 
