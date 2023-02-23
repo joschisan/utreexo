@@ -134,50 +134,45 @@ impl Node {
     }
 
     fn extend(&mut self, mut leaf: Leaf) -> Option<Leaf> {
-        if leaf.path.len() == 0 {
-            if self.hash != leaf.hash {
-                return None;
-            }
+        if leaf.path.len() == 0 && self.hash != leaf.hash {
+            return None;
+        }
 
+        if leaf.path.len() == 0 && self.hash == leaf.hash {
             self.delete = true;
-
-            leaf.proof.clear();
-
-            return Some(leaf);
+            return Some(Leaf::new(self.hash));
         }
 
-        if self.children.is_none() {
-            let extension = leaf.extension();
-
-            if self.hash != extension.hash {
-                return None;
-            }
-
-            *self = extension;
-
-            leaf.proof.truncate(leaf.path.len());
-
-            return Some(leaf);
-        };
-
-        let (left, right) = self.children.as_deref_mut().unwrap();
-
-        match leaf.path.pop().unwrap() {
-            Direction::Left => {
-                let mut leaf = left.extend(leaf)?;
-                leaf.path.push(Direction::Left);
-                leaf.proof.push(right.hash);
-                self.delete = true;
-                Some(leaf)
-            }
-            Direction::Right => {
-                let mut leaf = right.extend(leaf)?;
-                leaf.path.push(Direction::Right);
-                leaf.proof.push(left.hash);
-                self.delete = true;
-                Some(leaf)
+        if let Some((left, right)) = self.children.as_deref_mut() {
+            match leaf.path.pop().unwrap() {
+                Direction::Left => {
+                    let mut leaf = left.extend(leaf)?;
+                    leaf.path.push(Direction::Left);
+                    leaf.proof.push(right.hash);
+                    self.delete = true;
+                    return Some(leaf);
+                }
+                Direction::Right => {
+                    let mut leaf = right.extend(leaf)?;
+                    leaf.path.push(Direction::Right);
+                    leaf.proof.push(left.hash);
+                    self.delete = true;
+                    return Some(leaf);
+                }
             }
         }
+
+        let extension = leaf.extension();
+
+        if self.hash != extension.hash {
+            return None;
+        }
+
+        *self = extension;
+
+        leaf.proof.truncate(leaf.path.len());
+
+        return Some(leaf);
     }
 
     fn replace(&mut self, depth: usize, src: Node) -> Node {
