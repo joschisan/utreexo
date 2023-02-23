@@ -65,20 +65,6 @@ struct Node {
 }
 
 impl Node {
-    fn branch(left: Node, right: Node, cache: bool) -> Self {
-        Self {
-            hash: parent_hash(&left.hash, &right.hash),
-            cache,
-            delete: left.delete || right.delete,
-            proof: left.proof || right.proof,
-            children: if cache || left.delete || right.delete || left.proof || right.proof {
-                Some(Box::new((left, right)))
-            } else {
-                None
-            },
-        }
-    }
-
     fn delete(hash: Hash) -> Node {
         Node {
             hash,
@@ -107,7 +93,21 @@ impl Node {
         }
     }
 
-    fn verify(&self) {
+    fn branch(left: Node, right: Node, cache: bool) -> Self {
+        Self {
+            hash: parent_hash(&left.hash, &right.hash),
+            cache,
+            delete: left.delete || right.delete,
+            proof: left.proof || right.proof,
+            children: if cache || left.delete || right.delete || left.proof || right.proof {
+                Some(Box::new((left, right)))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn verify_invariants(&self) {
         if let Some((left, right)) = self.children.as_deref() {
             assert!(self.hash == parent_hash(&left.hash, &right.hash));
             assert!(self.cache || self.proof || self.delete);
@@ -115,13 +115,14 @@ impl Node {
             assert!(self.delete == left.delete || right.delete);
             assert!(self.proof == left.proof || right.proof);
 
-            left.verify();
-            right.verify();
+            left.verify_invariants();
+            right.verify_invariants();
         } else {
             assert!(!self.cache);
         }
     }
 
+    // prunes the tree if neccesarry
     fn update(&mut self) {
         let (left, right) = self.children.as_deref().expect("called update on a leaf");
         self.hash = parent_hash(&left.hash, &right.hash);
@@ -133,12 +134,15 @@ impl Node {
         }
     }
 
-    fn extend(&mut self, mut leaf: Leaf) -> Option<Leaf> {
+    // verify if the leaf to be deleted is actually part of the tree and return the leaf
+    // with a full proof on successful verification - extends the three if necessary
+    fn verify(&mut self, mut leaf: Leaf) -> Option<Leaf> {
         if leaf.path.len() == 0 && self.hash != leaf.hash {
             return None;
         }
 
         if leaf.path.len() == 0 && self.hash == leaf.hash {
+            assert!(self.children.is_none());
             self.delete = true;
             return Some(Leaf::new(self.hash));
         }
@@ -146,14 +150,14 @@ impl Node {
         if let Some((left, right)) = self.children.as_deref_mut() {
             match leaf.path.pop().unwrap() {
                 Direction::Left => {
-                    let mut leaf = left.extend(leaf)?;
+                    let mut leaf = left.verify(leaf)?;
                     leaf.path.push(Direction::Left);
                     leaf.proof.push(right.hash);
                     self.delete = true;
                     return Some(leaf);
                 }
                 Direction::Right => {
-                    let mut leaf = right.extend(leaf)?;
+                    let mut leaf = right.verify(leaf)?;
                     leaf.path.push(Direction::Right);
                     leaf.proof.push(left.hash);
                     self.delete = true;
@@ -175,26 +179,29 @@ impl Node {
         return Some(leaf);
     }
 
-    fn replace(&mut self, depth: usize, src: Node) -> Node {
-        assert!(self.delete);
-
+    // replace a node marked for deletion at given depth with source node
+    fn replace(&mut self, depth: usize, source: Node) -> Node {
         if depth == 0 {
-            return std::mem::replace(self, src);
+            return std::mem::replace(self, source);
         }
 
         let (left, right) = self.children.as_deref_mut().unwrap();
 
         if left.delete {
-            let replaced = left.replace(depth - 1, src);
+            let replaced = left.replace(depth - 1, source);
             self.update();
-            replaced
-        } else {
-            let replaced = right.replace(depth - 1, src);
+            return replaced;
+        } else if right.delete {
+            let replaced = right.replace(depth - 1, source);
             self.update();
-            replaced
+            return replaced;
         }
+
+        panic!();
     }
 
+    // splits the tree along a path of nodes marked for deletion and adds
+    // the resulting new roots to the accumulator
     fn split(self, roots: &mut [Option<Node>; 32]) -> usize {
         assert!(self.delete);
 
@@ -216,6 +223,8 @@ impl Node {
         }
     }
 
+    // returns a leaf with given hash from the sparse subtree of nodes with
+    // attribute delete equal to true
     fn proove(&self, hash: Hash) -> Option<Leaf> {
         if !self.proof {
             return None;
@@ -242,6 +251,8 @@ impl Node {
         None
     }
 
+    // sets delete attribute in all nodes to false - removes extensions
+    // made by node::verify()
     fn prune(&mut self) {
         if !self.delete {
             return;
@@ -260,6 +271,8 @@ impl Node {
         right.prune();
     }
 
+    // increases the trees proof limit by one - cuts memory consuption by
+    // this tree in half
     fn increase_proof_limit(&mut self) {
         assert!(!self.delete);
 
@@ -287,20 +300,22 @@ impl Accumulator {
         }
     }
 
-    fn verify(&self) {
+    fn verify_invariants(&self) {
         self.roots
             .iter()
             .filter_map(|r| r.as_ref())
-            .for_each(|r| r.verify())
+            .for_each(|r| r.verify_invariants())
     }
 
     fn update(&mut self, deletions: Vec<Leaf>, additions: Vec<(Hash, bool)>) -> Option<Vec<Leaf>> {
+        // verify that all leafs to be deleted are actually in the accumulator
         let proofs: Option<Vec<Leaf>> = deletions
             .into_iter()
-            .map(|leaf| self.roots[leaf.path.len()].as_mut()?.extend(leaf))
+            .map(|leaf| self.roots[leaf.path.len()].as_mut()?.verify(leaf))
             .collect();
 
         if proofs.is_none() {
+            // verification of the leafes has failed
             self.roots
                 .iter_mut()
                 .filter_map(|r| r.as_mut())
@@ -309,6 +324,7 @@ impl Accumulator {
             return None;
         }
 
+        // remove all nodes marked for deletion
         loop {
             let height_replace = self
                 .roots
@@ -324,8 +340,10 @@ impl Accumulator {
             let root_min = self.roots[height_min].take().unwrap();
 
             let n_roots = if height_replace == height_min {
+                // the tree of smallest height contains a leaf to be deleted
                 root_min.split(&mut self.roots)
             } else {
+                // the tree of smallest height does not contain a leaf to be deleted
                 self.roots[height_replace]
                     .as_mut()
                     .unwrap()
@@ -336,6 +354,7 @@ impl Accumulator {
             assert!(n_roots == height_min);
         }
 
+        // add all new leafes
         for (hash, proof) in additions {
             let mut root = if proof {
                 Node::proof(hash)
@@ -363,6 +382,8 @@ impl Accumulator {
             .find_map(|r| r.proove(hash))
     }
 
+    // increase the accumulator's proof limit by one - cuts the accumulator's
+    // memory consumption in half
     fn increase_proof_limit(&mut self) {
         self.roots
             .iter_mut()
@@ -454,8 +475,8 @@ mod tests {
             assert!(stxos_a == stxos);
             assert!(stxos_b == stxos);
 
-            accumulator_a.verify();
-            accumulator_b.verify();
+            accumulator_a.verify_invariants();
+            accumulator_b.verify_invariants();
 
             for hash in utxos
                 .into_iter()
